@@ -1,3 +1,4 @@
+
 import telebot
 import requests
 import sqlite3
@@ -12,21 +13,17 @@ from datetime import datetime, timedelta
 API_TOKEN = '8522305080:AAEVWG4LQWzOVh0hwrsOiEqBnIoD4PuFUtI'
 ADMIN_ID = 8058389631
 
-# Kanallar
 ORDERS_CHANNEL = "-1003591019560"   
 PAYMENTS_CHANNEL = "-1003672059498" 
 
-# WIQ API Sozlamalari
 WIQ_API_URL = "https://wiq.ru/api/v2"
 WIQ_API_KEY = "CH9gunPYthHlriASaX2yU2lCtyp7A9Vd"
 
-# To'lov ma'lumotlari
 CARD_NUMBER = "9860 1201 2436 4106"
 CARD_HOLDER = "Qosimov.U."
 
-# Narx siyosati
-PROFIT_MARGIN = 1.35   # 35% foyda
-VIP_DISCOUNT = 0.92    # 8% chegirma
+PROFIT_MARGIN = 1.35   
+VIP_DISCOUNT = 0.92    
 VIP_BRONZE_PRICE = 15000 
 VIP_GOLD_PRICE = 25000
 
@@ -101,6 +98,13 @@ def is_vip(uid):
         except: return None
     return None
 
+def set_vip(uid, days):
+    until = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect('nakrutka_final_v11.db')
+    conn.execute("UPDATE users SET vip_until = ? WHERE user_id = ?", (until, uid))
+    conn.commit()
+    conn.close()
+
 def check_sub(uid):
     if uid == ADMIN_ID: return True
     conn = sqlite3.connect('nakrutka_final_v11.db')
@@ -135,11 +139,12 @@ def main_kb(uid):
 def admin_kb():
     m = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     m.add("📊 Statistika", "🌐 API Balans")
-    m.add("💸 Pul qo'shish", "⬅️ Chiqish")
+    m.add("📢 Reklama", "💸 Pul qo'shish")
+    m.add("⬅️ Chiqish")
     return m
 
 # ==========================================
-# 5. HANDLERLAR (TUZATILDI)
+# 5. ASOSIY HANDLERLAR
 # ==========================================
 @bot.message_handler(commands=['start'])
 def start_handler(message):
@@ -150,15 +155,12 @@ def start_handler(message):
         chans = conn.execute("SELECT url FROM channels").fetchall()
         conn.close()
         mk = telebot.types.InlineKeyboardMarkup()
-        if not chans:
-            bot.send_message(uid, "Xush kelibsiz!", reply_markup=main_kb(uid))
-            return
         for i, c in enumerate(chans):
             mk.add(telebot.types.InlineKeyboardButton(f"➕ Kanal {i+1}", url=c[0]))
         mk.add(telebot.types.InlineKeyboardButton("✅ Tasdiqlash", callback_data="check_sub_now"))
         bot.send_message(uid, "👋 Botdan foydalanish uchun kanallarga obuna bo'ling:", reply_markup=mk)
         return
-    bot.send_message(uid, f"Xush kelibsiz!", reply_markup=main_kb(uid))
+    bot.send_message(uid, "Xush kelibsiz!", reply_markup=main_kb(uid))
 
 @bot.callback_query_handler(func=lambda c: c.data == "check_sub_now")
 def sub_callback(call):
@@ -168,6 +170,123 @@ def sub_callback(call):
     else:
         bot.answer_callback_query(call.id, "❌ Obuna bo'lmadingiz!", show_alert=True)
 
+# --- VIP VA BALANS ---
+@bot.message_handler(func=lambda m: m.text == "💰 Balans")
+def show_bal(message):
+    bal, _ = get_user_data(message.chat.id)
+    bot.send_message(message.chat.id, f"💰 Sizning balansingiz: {bal:,.0f} so'm")
+
+@bot.message_handler(func=lambda m: m.text == "💎 VIP Status")
+def vip_section(message):
+    v = is_vip(message.chat.id)
+    if v:
+        bot.send_message(message.chat.id, f"👑 VIP Status faol!\nTugash vaqti: {v.strftime('%Y-%m-%d')}")
+    else:
+        mk = telebot.types.InlineKeyboardMarkup()
+        mk.add(telebot.types.InlineKeyboardButton(f"🥉 Bronze (15 kun) - {VIP_BRONZE_PRICE}s", callback_data="buyv_15"))
+        mk.add(telebot.types.InlineKeyboardButton(f"🥇 Gold (30 kun) - {VIP_GOLD_PRICE}s", callback_data="buyv_30"))
+        bot.send_message(message.chat.id, "💎 VIP status bilan 8% chegirma oling:", reply_markup=mk)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('buyv_'))
+def buy_v_process(call):
+    days = int(call.data[5:])
+    price = VIP_BRONZE_PRICE if days == 15 else VIP_GOLD_PRICE
+    bal, _ = get_user_data(call.from_user.id)
+    if bal >= price:
+        update_bal(call.from_user.id, -price)
+        set_vip(call.from_user.id, days)
+        bot.edit_message_text("✅ VIP xarid qilindi!", call.message.chat.id, call.message.message_id)
+    else: 
+        bot.answer_callback_query(call.id, "Hisobda mablag' yetarli emas!", show_alert=True)
+
+# --- HISOB TO'LDIRISH ---
+@bot.message_handler(func=lambda m: m.text == "💳 Hisobni to'ldirish")
+def deposit_init(message):
+    txt = f"💳 Karta: `{CARD_NUMBER}`\n👤 Egasi: {CARD_HOLDER}\n\nTo'lovdan so'ng summani yozing:"
+    bot.send_message(message.chat.id, txt, parse_mode="Markdown")
+    msg = bot.send_message(message.chat.id, "💰 Summani kiriting:")
+    bot.register_next_step_handler(msg, deposit_check)
+
+def deposit_check(message):
+    try:
+        amt = int(message.text)
+        code = random.randint(100, 499)
+        total = amt + code
+        mk = telebot.types.InlineKeyboardMarkup().add(telebot.types.InlineKeyboardButton("✅ To'ladim", callback_data=f"pay_{total}"))
+        bot.send_message(message.chat.id, f"Iltimos, aynan **{total}** so'm o'tkazing va tugmani bosing.", parse_mode="Markdown", reply_markup=mk)
+    except: 
+        bot.send_message(message.chat.id, "❌ Faqat raqam kiriting!")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('pay_'))
+def pay_notify(call):
+    amt = call.data[4:]
+    bot.edit_message_text("✅ Adminga yuborildi. Tekshirilgach hisobingiz to'ldiriladi.", call.message.chat.id, call.message.message_id)
+    mk = telebot.types.InlineKeyboardMarkup().add(
+        telebot.types.InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"ok_{call.from_user.id}_{amt}"),
+        telebot.types.InlineKeyboardButton("❌ Rad etish", callback_data=f"no_{call.from_user.id}")
+    )
+    bot.send_message(PAYMENTS_CHANNEL, f"💰 To'lov: {amt}s\nID: `{call.from_user.id}`", reply_markup=mk)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('ok_'))
+def adm_confirm(call):
+    _, uid, amt = call.data.split('_')
+    update_bal(int(uid), float(amt))
+    bot.send_message(int(uid), f"✅ Hisobingiz {amt} so'mga to'ldirildi!")
+    bot.edit_message_text("✅ Tasdiqlandi", call.message.chat.id, call.message.message_id)
+
+# --- ADMIN PANEL FUNKSIYALARI ---
+@bot.message_handler(func=lambda m: m.text == "⚙️ Admin Panel" and m.from_user.id == ADMIN_ID)
+def admin_dash(message):
+    bot.send_message(ADMIN_ID, "Admin Panel:", reply_markup=admin_kb())
+
+@bot.message_handler(func=lambda m: m.text == "📊 Statistika" and m.from_user.id == ADMIN_ID)
+def admin_stats(message):
+    conn = sqlite3.connect('nakrutka_final_v11.db')
+    cnt = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    bot.send_message(ADMIN_ID, f"👥 Jami foydalanuvchilar: {cnt} ta")
+
+@bot.message_handler(func=lambda m: m.text == "🌐 API Balans" and m.from_user.id == ADMIN_ID)
+def check_api_bal(message):
+    try:
+        res = requests.post(WIQ_API_URL, data={'key': WIQ_API_KEY, 'action': 'balance'}).json()
+        usd_bal = float(res['balance'])
+        uzs_bal = usd_bal * get_usd_rate()
+        bot.send_message(ADMIN_ID, f"🌐 WIQ.ru Balansi:\n💵 {usd_bal} USD\n💰 {uzs_bal:,.0f} so'm")
+    except: bot.send_message(ADMIN_ID, "❌ API ulanishda xato!")
+
+@bot.message_handler(func=lambda m: m.text == "📢 Reklama" and m.from_user.id == ADMIN_ID)
+def ask_reklama(message):
+    msg = bot.send_message(ADMIN_ID, "📢 Reklama xabarini yuboring (Rasm, tekst yoki video):")
+    bot.register_next_step_handler(msg, send_reklama_to_all)
+
+def send_reklama_to_all(message):
+    conn = sqlite3.connect('nakrutka_final_v11.db')
+    users = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+    success, error = 0, 0
+    bot.send_message(ADMIN_ID, f"🚀 Tarqatish boshlandi (Jami: {len(users)} ta)...")
+    for user in users:
+        try:
+            bot.copy_message(chat_id=user[0], from_chat_id=ADMIN_ID, message_id=message.message_id)
+            success += 1
+            time.sleep(0.1)
+        except: error += 1
+    bot.send_message(ADMIN_ID, f"✅ Tugatildi!\n🟢 Yetkazildi: {success}\n🔴 Bloklangan: {error}")
+
+@bot.message_handler(func=lambda m: m.text == "💸 Pul qo'shish" and m.from_user.id == ADMIN_ID)
+def admin_add_m(message):
+    msg = bot.send_message(ADMIN_ID, "ID va Summa (Masalan: 12345 10000):")
+    bot.register_next_step_handler(msg, admin_add_m_final)
+
+def admin_add_m_final(message):
+    try:
+        u, a = message.text.split()
+        update_bal(int(u), float(a))
+        bot.send_message(ADMIN_ID, f"✅ {u} ID ga {a} so'm qo'shildi")
+    except: bot.send_message(ADMIN_ID, "❌ Xato format!")
+
+# --- BUYURTMA TIZIMI ---
 @bot.message_handler(func=lambda m: m.text == "🚀 Buyurtma berish")
 def order_start(message):
     if not check_sub(message.chat.id): return
@@ -176,7 +295,6 @@ def order_start(message):
         mk.add(telebot.types.InlineKeyboardButton(p, callback_data=f"plat_{p}"))
     bot.send_message(message.chat.id, "📱 Ijtimoiy tarmoqni tanlang:", reply_markup=mk)
 
-# --- BUYURTMA QISMLARI ---
 @bot.callback_query_handler(func=lambda c: c.data.startswith('plat_'))
 def order_cat(call):
     p = call.data[5:]
@@ -198,7 +316,7 @@ def order_serv(call):
                 price = float(s['rate']) * rate * PROFIT_MARGIN
                 mk.add(telebot.types.InlineKeyboardButton(f"{s['name'][:25]} | {price:,.0f}s", callback_data=f"ser_{s['service']}"))
         bot.edit_message_text(f"⬇️ {c} turini tanlang:", call.message.chat.id, call.message.message_id, reply_markup=mk)
-    except: bot.answer_callback_query(call.id, "API xatosi!")
+    except: bot.answer_callback_query(call.id, "❌ API ulanishda xato!")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('ser_'))
 def order_link(call):
@@ -227,36 +345,11 @@ def order_final(message):
                 update_bal(uid, -cost)
                 bot.send_message(uid, f"✅ Buyurtma qabul qilindi!\n💰 Narx: {cost:,.0f} so'm")
                 bot.send_message(ORDERS_CHANNEL, f"🛒 **Yangi Buyurtma**\nID: {res['order']}\nSumma: {cost:,.0f}s")
-            else: bot.send_message(uid, f"Xato: {res.get('error')}")
+            else: bot.send_message(uid, f"❌ Xato: {res.get('error')}")
         else: bot.send_message(uid, "❌ Mablag' yetarli emas!")
-    except: bot.send_message(uid, "❌ Xatolik!")
+    except: bot.send_message(uid, "❌ Xatolik yuz berdi!")
 
-# --- ADMIN FUNKSIYALARI ---
-@bot.message_handler(func=lambda m: m.text == "⚙️ Admin Panel" and m.from_user.id == ADMIN_ID)
-def admin_dash(message):
-    bot.send_message(ADMIN_ID, "Admin Panel:", reply_markup=admin_kb())
-
-@bot.message_handler(func=lambda m: m.text == "📊 Statistika" and m.from_user.id == ADMIN_ID)
-def admin_stats(message):
-    conn = sqlite3.connect('nakrutka_final_v11.db')
-    cnt = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    conn.close()
-    bot.send_message(ADMIN_ID, f"👥 Jami foydalanuvchilar: {cnt} ta")
-
-@bot.message_handler(func=lambda m: m.text == "🌐 API Balans" and m.from_user.id == ADMIN_ID)
-def check_api_bal(message):
-    try:
-        res = requests.post(WIQ_API_URL, data={'key': WIQ_API_KEY, 'action': 'balance'}).json()
-        usd_bal = float(res['balance'])
-        uzs_bal = usd_bal * get_usd_rate()
-        bot.send_message(ADMIN_ID, f"🌐 WIQ.ru Balansi:\n💵 {usd_bal} USD\n💰 {uzs_bal:,.0f} so'm")
-    except: bot.send_message(ADMIN_ID, "API balansini olib bo'lmadi!")
-
-@bot.message_handler(func=lambda m: m.text == "💰 Balans")
-def show_bal(message):
-    bal, _ = get_user_data(message.chat.id)
-    bot.send_message(message.chat.id, f"💰 Sizning balansingiz: {bal:,.0f} so'm")
-
+# --- BOSHQA ---
 @bot.message_handler(func=lambda m: m.text == "💵 Dollar kursi")
 def dollar_rate(message):
     bot.send_message(message.chat.id, f"💵 1 USD = {get_usd_rate():,.0f} so'm")
@@ -265,9 +358,8 @@ def dollar_rate(message):
 def exit_admin(message):
     bot.send_message(message.chat.id, "Bosh menyu:", reply_markup=main_kb(message.chat.id))
 
-# --- ASOSIY ---
+# --- ISHGA TUSHIRISH ---
 if __name__ == "__main__":
     init_db()
-    print("Bot Render-da muvaffaqiyatli ishlamoqda!")
+    print("Bot muvaffaqiyatli ishga tushdi!")
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
-
